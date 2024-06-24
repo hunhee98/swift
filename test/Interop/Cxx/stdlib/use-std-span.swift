@@ -1,7 +1,10 @@
 // RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop -Xcc -std=c++20)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop -Xcc -std=c++20 -Xcc -D_LIBCPP_ENABLE_HARDENED_MODE)
 
 // FIXME swift-ci linux tests do not support std::span
 // UNSUPPORTED: OS=linux-gnu
+
+// REQUIRES: executable_test
 
 import StdlibUnittest
 #if !BRIDGING_HEADER
@@ -10,6 +13,24 @@ import StdSpan
 import CxxStdlib
 
 var StdSpanTestSuite = TestSuite("StdSpan")
+
+func takesSpanOfInt(s: Span) {
+  expectEqual(s.size(), 3)
+  expectFalse(s.empty())
+
+  expectEqual(s[0], 1)
+  expectEqual(s[1], 2)
+  expectEqual(s[2], 3)
+}
+
+func takesSpanOfString(s: SpanOfString) {
+  expectEqual(s.size(), 3)
+  expectFalse(s.empty())
+
+  expectEqual(s[0], "")
+  expectEqual(s[1], "ab")
+  expectEqual(s[2], "abc")
+}
 
 StdSpanTestSuite.test("EmptySpan") {
   let s = Span()
@@ -39,6 +60,14 @@ StdSpanTestSuite.test("InitStringSpan") {
   expectEqual(sspan[0], "")
   expectEqual(sspan[1], "ab")
   expectEqual(sspan[2], "abc")
+}
+
+StdSpanTestSuite.test("SpanOfIntAsParam") {
+  takesSpanOfInt(s: ispan)
+}
+
+StdSpanTestSuite.test("SpanOfStringAsParam") {
+  takesSpanOfString(s: sspan)
 }
 
 runAllTests()
