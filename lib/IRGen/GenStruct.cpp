@@ -1316,6 +1316,7 @@ class ClangRecordLowering {
   SmallVector<llvm::Type *, 8> LLVMFields;
   SmallVector<ClangFieldInfo, 8> FieldInfos;
   Size NextOffset = Size(0);
+  Size SubobjectAdjustment = Size(0);
   unsigned NextExplosionIndex = 0;
 public:
   ClangRecordLowering(IRGenModule &IGM, StructDecl *swiftDecl,
@@ -1333,8 +1334,8 @@ public:
     if (ClangDecl->isUnion()) {
       collectUnionFields();
     } else {
-      collectBases();
-      collectStructFields();
+      collectBases(ClangDecl);
+      collectStructFields(ClangDecl);
     }
   }
 
@@ -1365,63 +1366,42 @@ private:
     return (swiftField->getClangNode().castAsDecl() == clangField);
   }
 
-  void collectBases() {
-    auto &layout = ClangDecl->getASTContext().getASTRecordLayout(ClangDecl);
+  void collectVirtualBases() {
+  }
 
-    if (auto cxxRecord = dyn_cast<clang::CXXRecordDecl>(ClangDecl)) {
-      // The empty bases are all at offset 0, so we need to remove them to
-      // reliably calculate base subobject sizes using the next base's offset.
-      SmallVector<clang::CXXBaseSpecifier, 8> nonEmptyNonVirtualBases;
-      llvm::copy_if(
-          cxxRecord->bases(), std::back_inserter(nonEmptyNonVirtualBases),
-          [](const clang::CXXBaseSpecifier &base) {
-            const auto *cxxRecord = cast<clang::CXXRecordDecl>(
-                cast<clang::RecordType>(base.getType().getCanonicalType())
-                    ->getDecl());
-            return !base.isVirtual() && !cxxRecord->isEmpty();
-          });
-      if (nonEmptyNonVirtualBases.size() == 0)
-        return;
-      auto firstBaseType =
-          nonEmptyNonVirtualBases.front().getType().getCanonicalType();
-      const auto *lastBaseCxxRecord = cast<clang::CXXRecordDecl>(
-          cast<clang::RecordType>(firstBaseType)->getDecl());
-      for (auto [nextBase, currentBase] :
-           llvm::zip_first(llvm::drop_begin(nonEmptyNonVirtualBases),
-                           nonEmptyNonVirtualBases)) {
-        auto baseType = currentBase.getType().getCanonicalType();
+  void collectBases(const clang::RecordDecl *decl) {
+    auto &layout = decl->getASTContext().getASTRecordLayout(decl);
+    if (auto cxxRecord = dyn_cast<clang::CXXRecordDecl>(decl)) {
+      for (auto base : cxxRecord->bases()) {
+        if (base.isVirtual())
+          continue;
+
+        auto baseType = base.getType().getCanonicalType();
 
         auto baseRecord = cast<clang::RecordType>(baseType)->getDecl();
         auto baseCxxRecord = cast<clang::CXXRecordDecl>(baseRecord);
 
-        auto nextBaseType = nextBase.getType().getCanonicalType();
-        auto nextBaseRecord = cast<clang::RecordType>(nextBaseType)->getDecl();
-        auto nextBaseCxxRecord = cast<clang::CXXRecordDecl>(nextBaseRecord);
-        lastBaseCxxRecord = nextBaseCxxRecord;
+        if (baseCxxRecord->isEmpty())
+          continue;
 
-        auto offset = layout.getBaseClassOffset(baseCxxRecord);
-        auto nextOffset = layout.getBaseClassOffset(nextBaseCxxRecord);
-        auto size = nextOffset - offset;
-        addOpaqueField(Size(offset.getQuantity()), Size(size.getQuantity()));
-      }
-      // Handle the last base. Use the first field's offset, or if there are no
-      // fields, the object's size to calculate the base subobject size.
-      if (!lastBaseCxxRecord->isEmpty()) {
-        auto offset = layout.getBaseClassOffset(lastBaseCxxRecord);
-        auto nextOffset =
-            (layout.getFieldCount() > 0)
-                ? clang::CharUnits::fromQuantity(layout.getFieldOffset(0) / 8)
-                : layout.getSize();
-        auto size = nextOffset - offset;
-        addOpaqueField(Size(offset.getQuantity()), Size(size.getQuantity()));
+        auto baseOffset = Size(layout.getBaseClassOffset(baseCxxRecord).getQuantity());
+        SubobjectAdjustment += baseOffset;
+        collectBases(baseCxxRecord);
+        collectStructFields(baseCxxRecord);
+        SubobjectAdjustment -= baseOffset;
       }
     }
   }
 
-  void collectStructFields() {
-    auto cfi = ClangDecl->field_begin(), cfe = ClangDecl->field_end();
+  void collectStructFields(const clang::RecordDecl *decl) {
+    auto cfi = decl->field_begin(), cfe = decl->field_end();
+    const auto& layout = ClangContext.getASTRecordLayout(decl);
     auto swiftProperties = SwiftDecl->getStoredProperties();
     auto sfi = swiftProperties.begin(), sfe = swiftProperties.end();
+    // When collecting fields from the base subobjects, we do not have corresponding swift
+    // stored properties.
+    if (decl != ClangDecl)
+      sfi = swiftProperties.end();
 
     while (cfi != cfe) {
       const clang::FieldDecl *clangField = *cfi++;
@@ -1431,13 +1411,13 @@ private:
       if (clangField->isBitField()) {
         // Collect all of the following bitfields.
         unsigned bitStart =
-          ClangLayout.getFieldOffset(clangField->getFieldIndex());
+          layout.getFieldOffset(clangField->getFieldIndex());
         unsigned bitEnd = bitStart + clangField->getBitWidthValue(ClangContext);
 
         while (cfi != cfe && (*cfi)->isBitField()) {
           clangField = *cfi++;
           unsigned nextStart =
-            ClangLayout.getFieldOffset(clangField->getFieldIndex());
+            layout.getFieldOffset(clangField->getFieldIndex());
           assert(nextStart >= bitEnd && "laying out bit-fields out of order?");
 
           // In a heuristic effort to reduce the number of weird-sized
@@ -1455,7 +1435,7 @@ private:
         continue;
       }
 
-      VarDecl *swiftField;
+      VarDecl *swiftField = nullptr;
       if (sfi != sfe) {
         swiftField = *sfi;
         if (isImportOfClangField(swiftField, clangField)) {
@@ -1463,33 +1443,32 @@ private:
         } else {
           swiftField = nullptr;
         }
-      } else {
-        swiftField = nullptr;
-      }
+      } 
 
       // Try to position this field.  If this fails, it's because we
       // didn't lay out padding correctly.
-      addStructField(clangField, swiftField);
+      addStructField(clangField, swiftField, layout);
     }
 
     assert(sfi == sfe && "more Swift fields than there were Clang fields?");
 
+    Size objectTotalStride = Size(layout.getSize().getQuantity());
     // We never take advantage of tail padding, because that would prevent
     // us from passing the address of the object off to C, which is a pretty
     // likely scenario for imported C types.
-    assert(NextOffset <= TotalStride);
-    assert(SpareBits.size() <= TotalStride.getValueInBits());
-    if (NextOffset < TotalStride) {
-      addPaddingField(TotalStride);
+    assert(NextOffset <= objectTotalStride);
+    assert(SpareBits.size() <= objectTotalStride.getValueInBits());
+    if (NextOffset < objectTotalStride) {
+      addPaddingField(objectTotalStride);
     }
   }
 
   /// Place the next struct field at its appropriate offset.
   void addStructField(const clang::FieldDecl *clangField,
-                      VarDecl *swiftField) {
-    unsigned fieldOffset = ClangLayout.getFieldOffset(clangField->getFieldIndex());
+                      VarDecl *swiftField, const clang::ASTRecordLayout& layout) {
+    unsigned fieldOffset = layout.getFieldOffset(clangField->getFieldIndex());
     assert(!clangField->isBitField());
-    Size offset(fieldOffset / 8);
+    Size offset( SubobjectAdjustment.getValue() + fieldOffset / 8);
 
     // If we have a Swift import of this type, use our lowered information.
     if (swiftField) {
