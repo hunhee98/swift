@@ -1767,3 +1767,45 @@ extension MyActor {
     }
   }
 }
+
+public struct TimeoutError: Error, CustomStringConvertible {
+  public var description: String { "Timed out" }
+}
+
+// We used to not merge the isolation below correctly causing us to emit a crash
+// due to undefined behavior. Make sure we do not crash or emit an unhandled
+// pattern error.
+public func doNotCrashOrEmitUnhandledPatternErrors<T: Sendable>(
+  _ duration: Duration,
+  _ body: @escaping @Sendable () async throws -> T
+) async throws -> T {
+  try await withThrowingTaskGroup(of: T.self) { taskGroup in
+    taskGroup.addTask {
+      try await Task.sleep(for: duration)
+      throw TimeoutError()
+    }
+    taskGroup.addTask {
+      return try await body()
+    }
+    for try await value in taskGroup {
+      taskGroup.cancelAll()
+      return value
+    }
+    throw CancellationError()
+  }
+}
+
+/// The following makes sure that when we have a function like test2 with an
+/// assigned isolation that returns a Sendable value... we treat the value as
+/// actually Sendable. This occurs in this example via the result of the default
+/// parameter function for string.
+///
+/// We shouldn't emit any diagnostic here.
+actor FunctionWithSendableResultAndIsolationActor {
+    func foo() -> String {
+        return string()
+    }
+    func string(someCondition: Bool = false) -> String {
+        return ""
+    }
+}

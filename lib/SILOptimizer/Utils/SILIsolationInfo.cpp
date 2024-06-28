@@ -364,21 +364,31 @@ SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
     }
 
     if (auto *isolatedOp = fas.getIsolatedArgumentOperandOrNullPtr()) {
-      // First pattern match from global actors being passed as isolated
-      // parameters. This gives us better type information. If we can pattern
-      // match... we should!
+      // First see if we have an enum inst.
       if (auto *ei = dyn_cast<EnumInst>(isolatedOp->get())) {
-        if (ei->getElement()->getParentEnum()->isOptionalDecl() &&
-            ei->hasOperand()) {
-          if (auto *ieri = dyn_cast<InitExistentialRefInst>(ei->getOperand())) {
-            CanType selfASTType = ieri->getFormalConcreteType();
+        if (ei->getElement()->getParentEnum()->isOptionalDecl()) {
+          // Pattern match from global actors being passed as isolated
+          // parameters. This gives us better type information. If we can
+          // pattern match... we should!
+          if (ei->hasOperand()) {
+            if (auto *ieri =
+                    dyn_cast<InitExistentialRefInst>(ei->getOperand())) {
+              CanType selfASTType = ieri->getFormalConcreteType();
 
-            if (auto *nomDecl = selfASTType->getAnyActor()) {
-              // The SILValue() parameter doesn't matter until we have isolation
-              // history.
-              if (nomDecl->isGlobalActor())
-                return SILIsolationInfo::getGlobalActorIsolated(SILValue(),
-                                                                nomDecl);
+              if (auto *nomDecl = selfASTType->getAnyActor()) {
+                // The SILValue() parameter doesn't matter until we have
+                // isolation history.
+                if (nomDecl->isGlobalActor())
+                  return SILIsolationInfo::getGlobalActorIsolated(SILValue(),
+                                                                  nomDecl);
+              }
+            }
+          } else {
+            // In this case, we have a .none so we are attempting to use the
+            // global queue. In such a case, we need to not use the enum as our
+            // value and instead need to grab the isolation of our apply.
+            if (auto isolationInfo = get(fas.getCallee())) {
+              return isolationInfo;
             }
           }
         }
@@ -394,6 +404,7 @@ SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
         // TODO: We really should be doing this based off of an Operand. Then
         // we would get the SILValue() for the first element. Today this can
         // only mess up isolation history.
+
         return SILIsolationInfo::getActorInstanceIsolated(
             SILValue(), isolatedOp->get(), nomDecl);
       }
@@ -1098,6 +1109,30 @@ bool SILIsolationInfo::isNonSendableType(SILType type, SILFunction *fn) {
 
   // Otherwise, delegate to seeing if type conforms to the Sendable protocol.
   return !type.isSendable(fn);
+}
+
+//===----------------------------------------------------------------------===//
+//                            MARK: ActorInstance
+//===----------------------------------------------------------------------===//
+
+SILValue ActorInstance::lookThroughInsts(SILValue value) {
+  if (!value)
+    return value;
+
+  while (auto *svi = dyn_cast<SingleValueInstruction>(value)) {
+    if (isa<EndInitLetRefInst>(svi) || isa<CopyValueInst>(svi) ||
+        isa<MoveValueInst>(svi) || isa<ExplicitCopyValueInst>(svi) ||
+        isa<BeginBorrowInst>(svi) ||
+        isa<CopyableToMoveOnlyWrapperValueInst>(svi) ||
+        isa<MoveOnlyWrapperToCopyableValueInst>(svi)) {
+      value = lookThroughInsts(svi->getOperand(0));
+      continue;
+    }
+
+    break;
+  }
+
+  return value;
 }
 
 //===----------------------------------------------------------------------===//
