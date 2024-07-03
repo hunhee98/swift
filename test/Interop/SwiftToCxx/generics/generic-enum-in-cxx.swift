@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Generics -clang-header-expose-decls=all-public -emit-clang-header-path %t/generics.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Generics -enable-experimental-cxx-interop -emit-clang-header-path %t/generics.h
 // RUN: %FileCheck %s < %t/generics.h
 // RUN: %check-interop-cxx-header-in-clang(%t/generics.h -Wno-reserved-identifier)
 
@@ -25,7 +25,7 @@ public func constructTracksDeinit() -> TracksDeinit {
 
 @frozen
 public struct StructForEnum {
-    let x: TracksDeinit
+    public let x: TracksDeinit?
 
     public init() {
         x = TracksDeinit()
@@ -53,6 +53,11 @@ public struct StructForEnum {
     public var computedProp: Int {
         return 42
     }
+}
+
+@frozen public enum GenericCustomType<T> {
+    case success(T?)
+    case failure
 }
 
 public func makeGenericOpt<T>(_ x: T) -> GenericOpt<T> {
